@@ -1,0 +1,2463 @@
+/*********************************************************************************************************************************
+ * 1. module 명     : zngmbcom00020.pc
+ * 2. module 설명   : DB TO DB를 처리함 ( 대용량 TABLE을 UNLOAD하여 선택한 DATABASE에 로드한다 )
+ * 3. 작성일자      : 2006/07/03 20:55:48
+ * 4. 작성자        : 이창렬
+ * 5. 호출함수명
+ *    1) proframe   : 없음
+ *    2) tmax       : 없음
+ *    3) 사용자 정의: 없음
+ *
+ *    history 영역에 변경 내역 추가
+ *
+ *    버전      : 성명     : 일자                : 근거 자료     : 변경 내용
+ *    ---------- ---------- --------------------- --------------- ----------------------------------------------------------------
+ *    설계      : wlnd21   : 2006/07/03 20:55:48 : new 고객 구축 : 프로그램 spec 정의 (사양서 작성)
+ *    ver1.00   : wlnd21   : 2006/07/03 20:55:48 : new 고객 구축 : 신규 개발
+ *    ver1.10   : wlnd21   : 2008/08/03 16:00:00 :  한레코드에 2라인 나오는 경우 수정
+ *              : aatd02   : 2009/01/13          : 청구전용 parallel up 처리 추가로 인하여 프로그램 수정
+ *              : aatd02   : 2011/10/18          : Ukey2.0 성능개선 권고안에 따른 oracle명령어 수정
+ *
+ * 6. 특기 및 유의 사항
+ *                      1. DB TO DB 작업시 사용한다.( sqlldr를 병렬로 작업하게 구성함)
+ ********************************************************************************************************************************/
+/* --------------------------------------- include files ---------------------------------------------------------------------- */
+#include <zngmbcom00020.h>
+#include <zngmmpwd00010.h>
+/*--------------------------------- constant, macro definitions ----------------------------------------------------------------*/
+/* ----------------------------------- structure definitions -------------------------------------------------------------------*/
+typedef struct errcodeset_s errcodeset_t;
+struct errcodeset_s
+{
+    int  number;
+    char msg[100];
+};
+static errcodeset_t errcodeset[] = {
+    {1001  ,"source db 접속정보를 얻지 못함 " }
+    ,{1002  ,"input 값 미입력  "}
+    ,{1101  ,"source db 연결 실패" }
+    ,{1102  ,"oracle cursor open 실패" }
+    ,{1103  ,"select 구분 parsing 오류" }
+    ,{1104  ,"select 구분에서 column정보 추출 오류 " }
+    ,{1105  ,"오라클 curosr fetch 실패      " }
+    ,{1201  ,"ctl  파일 생성 실패 " }
+    ,{1301  ,"data 파일 생성 실패 " }
+    ,{1501  ,"child process 수행 불가 " }
+    ,{2001  ,"target db 접속정보를 얻지 못함 " }
+    ,{2002  ,"sql*loader에서 오류가 보고됨  " }
+    ,{2003  ,"sql*loader가 비정상적으로 종료됨 " }
+    ,{2004  ,"sql*loader수행중 kill signal " }
+    ,{2005  ,"sql*loader수행중 알수 없는 오류 발생 " }
+    ,{2006  ,"source db와 target db 동일" }
+    ,{2007  ,"target table trucate 에러" }
+    ,{9001  ,"bad 파일 존재하지만 정상 진행 " }
+    ,{9002  ,"정상 진행" }
+    ,{9003  ,"index rebuild를 실패했지만 정상진행 " }
+    ,{0  , NULL}
+};
+typedef struct zngmf_tab_unload_ex_ctx_s zngmf_tab_unload_ex_ctx_t;
+struct zngmf_tab_unload_ex_ctx_s {
+    long          job_count   ;
+    int           action      ;
+    long          global_index;
+    long          direct_flag ;
+    long          multi_flag  ;
+    long          rebuild_flag;
+    long          truncate_flag;
+    char          ld_type     [200];
+    char          target_type [100];
+    char          target_db   [100];
+    char          input_table [100];
+    char          owner       [100];
+    char          table_name  [100];
+};
+/*--------------------------------- constant, macro definitions ----------------------------------------------------------------*/
+/* general flags */
+#define OCI_PARAMETER_NOT_USED  -1
+#define OCI_NULL_TERMINATED_STR -1
+/* oparse flags */
+#define DEFER_PARSE             1
+#define NATIVE                  1
+#define VERSION_7               2
+/* oexfet flags */
+#define OCI_CANCEL_CURSOR       1
+#define OCI_NOT_CANCEL_CURSOR   0
+#define OCI_EXACT               1
+#define OCI_NOT_EXACT           0
+/* SQLCODE constants */
+#define SQLCODE_OK              0
+#define NO_DATA_FOUND           1403
+#define VAR_NOT_IN_SELECT_LIST  1007
+/* Other Oracle constants */
+#define MAX_ORACLE_ERROR_SIZE   1001    /* 1000 + 1 for string_terminator */
+#define MAX_OBJECT_LEN          31      /* 30   + 1 for string_terminator */
+#define MAX_INDEXED_COLUMNS     16
+#define MAX_COLUMNS             255     /* max nr. of columns in table    */
+#define ORA_DATE_FORMAT         "SYYYYMMDDHH24MISS"
+/* Fully specified */
+/* Dumper constants */
+#define DEFAULT_ARRAY_BUFFER    (int) 65536
+#define FIXED_FORMAT            1
+#define VARIABLE_FORMAT         2
+#define DEFAULT_FORMAT          (VARIABLE_FORMAT)
+#define MAX_FIELD_SIZE          4000
+/* Some character constants */
+#define SPACE                   ' '
+#define STRING_TERMINATOR       '\0'
+#define MINUS_SIGN              '-'
+#define PERIOD                  '.'
+#define EOL                     '\n'
+#define TAB                     '\t'
+#define COMMENT_MARKER          '#'
+#define EXCLAMATION             '!'
+#define COMMA                   ','
+#define DOUBLE_QUOTE            '"'
+#define TERMINATOR              (COMMA)
+#define ENCLOSURE               (DOUBLE_QUOTE)
+#define ORACLE_VERSION
+#define NULL_INDICATOR          -1
+#define CONTROLFILE_EXT         ".ctl"
+#define DATAFILE_EXT            ".dat"
+#define DEBUG_ENV_VAR           "DUMPER_DEBUG"
+#define EMPTY_STRING            ""
+#define df_bufferSIZE   70000
+/* 청구전용 parallem up 처리 추가로인한 수정 */
+static long gl_com00020_parallel_cnt;
+ 
+/* define Logon Data Area and Host Data Area */
+static Lda_Def lda;
+/*
+ * WATCH IT !!!!
+ *  - On Solaris, define it as ub4 hda[64];
+ *  - Normally,   define it as ub1 hda[256];
+ *  - Otherwise,  define it as ub1 hda[512];
+ */
+static  ub1     hda[512];
+static char line_buf[ 70000];
+static char target_db_mark[ 1024];
+/* declare 1 cursor: shared for (at most) 3 select statements */
+static Cda_Def g_cursor;
+/* ------------------------------------ function prototypes --------------------------------------------------------------------*/
+static long close_cursor     (  void  );
+static long connect_to_oracle(  char *p_userpass  );
+static FILE *create_control_file
+(   FILE *p_outf
+    ,      char *p_outf_name
+    ,      char *p_ctl_name
+    ,      char *p_order_by
+    ,      char *p_index_name_with_owner
+    ,      int   p_which_format
+    ,      char *p_prt_name
+    ,      char *p_table_name
+    ,      char *mid
+    ,      int   istrun
+    );
+
+static long
+desc_and_process_tbl
+(
+ char *p_outf_name
+ , char *p_prt_name
+ , char *p_ctl_name
+ , char *p_table_name
+ , char *p_rest
+ , char *p_order_by
+ , int   p_array_buffer_size
+ , char *p_index_name_with_owner
+ , int  p_which_format
+ , char *mid
+ , int   action
+ , int   parallel_gb
+ );
+static void convert_ora_date( char *p_input_date,char *p_output_date );
+static void handle_oracle_error(  Cda_Def *p_cursor );
+static long logoff_from_oracle(  );
+static long open_cursor();
+static char *parse_component
+(   char *p_input_line
+    ,   char *p_component
+    ,   int   p_until_eos
+    );
+static void print_column
+(  FILE *p_outf
+   ,     int   p_which_format
+   ,     char *p_column
+   ,     short p_col_len
+   );
+static void print_dumper_info(  );
+static void print_rows
+(
+ int    p_rows_to_print
+ ,int    p_which_format
+ ,int    p_number_of_columns
+ ,FILE  *p_outf
+ ,char  *p_column[]
+ ,short  p_col_type[]
+ ,short  p_col_len[]
+ ,short  p_col_rlen[]
+ ,short *p_ind_col[]
+ );
+static void print_var_column(  FILE *p_outf, char *p_column  );
+static long special_chk     ( char *p_column);
+/* ------------------------------------ function prototypes --------------------------------------------------------------------*/
+static long a000_input_check          (zngmf_tab_unload_load_ex_t *itf,     zngmf_tab_unload_ex_ctx_t *ctx);
+static long a100_get_load_db_type     (zngmf_tab_unload_load_ex_t *itf,     zngmf_tab_unload_ex_ctx_t *ctx);
+static long b000_index_check          (zngmf_tab_unload_load_ex_t *itf,     zngmf_tab_unload_ex_ctx_t *ctx);
+static long b100_global_index_check   (zngmf_tab_unload_ex_ctx_t *ctx );
+static long c000_unload_load_proc     (zngmf_tab_unload_load_ex_t *itf,     zngmf_tab_unload_ex_ctx_t *ctx);
+static long c001_target_table_truncate(zngmf_tab_unload_load_ex_t *itf ,    zngmf_tab_unload_ex_ctx_t *ctx);
+static long c100_child_proc           (zngmf_tab_unload_load_ex_sub_t *job, zngmf_tab_unload_ex_ctx_t *ctx);
+static long c101_child_fork_proc      (zngmf_tab_unload_load_ex_sub_t *job, zngmf_tab_unload_ex_ctx_t *ctx);
+static long c110_connection           ( );
+static long c120_normal_end           ( );
+static long c300_load_proc            (zngmf_tab_unload_load_ex_sub_t *job,zngmf_tab_unload_ex_ctx_t *ctx);
+static long c310_err_exit_proc        (zngmf_tab_unload_ex_ctx_t *ctx,     zngmf_tab_unload_load_ex_sub_t *job,int iserr );
+static long d000_rebuild_proc         (zngmf_tab_unload_load_ex_t *itf,    zngmf_tab_unload_ex_ctx_t *ctx);
+static long d100_index_rebuild        (zngmf_tab_unload_load_ex_t *itf,    zngmf_tab_unload_ex_ctx_t *ctx);
+static long e000_source_connect();
+static void waitchild                 (int sigid );
+static long get_target_type           (zngmf_tab_unload_ex_ctx_t *ctx);
+static long split_ownername           ( char *longtable , char *owner, char *table);
+static long check_bad_file            ( char *filename  );
+static long set_error_code            ( long groupcode, long errorcode );
+/* ------------------------------------ function prototypes --------------------------------------------------------------------*/
+static long a000_input_check_1        (zngmf_tab_unload_load_ex_t *itf ,zngmf_tab_unload_ex_ctx_t *ctx);
+static long a100_set_ctx              (zngmf_tab_unload_load_ex_t *itf ,zngmf_tab_unload_ex_ctx_t *ctx);
+static long b000_set_ctx              (zngmf_tab_unload_load_ex_t *itf ,zngmf_tab_unload_ex_ctx_t *ctx);
+static long c000_load                 (zngmf_tab_unload_load_ex_t *itf ,zngmf_tab_unload_ex_ctx_t *ctx);
+static long c100_child_proc_1         (zngmf_tab_unload_load_ex_sub_t *job,zngmf_tab_unload_ex_ctx_t *ctx);
+static long c110_child_fork_proc_1    (zngmf_tab_unload_load_ex_sub_t *job,zngmf_tab_unload_ex_ctx_t *ctx);
+static long c111_load_proc_1          (zngmf_tab_unload_load_ex_sub_t *job,zngmf_tab_unload_ex_ctx_t *ctx);
+static long file_exist_check          (char *filename);
+/* --------------------------------------- function body -----------------------------------------------------------------------*/
+/*
+ *  unload & load job  수행
+ */
+    long
+zngmf_tab_unload_load_ex(zngmf_tab_unload_load_ex_t *itf)
+{
+    long rc = RC_NRM;
+    zngmf_tab_unload_ex_ctx_t _ctx;
+    zngmf_tab_unload_ex_ctx_t *ctx = &_ctx;
+    /* 청구전용 parallem up 처리 추가로인한 수정 */
+    gl_com00020_parallel_cnt   =    0;
+    memset( ctx, 0x00, sizeof(zngmf_tab_unload_ex_ctx_t));
+    PFM_DBG("$$ version 정보 : 20060823 $$");
+    /* input 값 검증 */
+    PFM_TRY( a000_input_check     ( itf, ctx));
+    /* index check */
+    PFM_TRY( b000_index_check     ( itf, ctx));
+    /* unload / load  처리 */
+    PFM_TRY( c000_unload_load_proc( itf, ctx));
+    /* rebuild 처리   */
+    PFM_TRY( d000_rebuild_proc    ( itf, ctx));
+    /* source에 대한 reconnect 처리 */
+    /**
+      PFM_TRY( e000_source_connect());
+     **/
+    return RC_NRM;
+PFM_CATCH:
+    return RC_ERR;
+}
+/*
+ *  load job  수행
+ */
+    long
+zngmf_tab_load_ex( zngmf_tab_unload_load_ex_t *itf )
+{
+    long rc = RC_NRM;
+    zngmf_tab_unload_ex_ctx_t _ctx;
+    zngmf_tab_unload_ex_ctx_t *ctx = &_ctx;
+    /* 청구전용 parallem up 처리 추가로인한 수정 */
+    gl_com00020_parallel_cnt   =    0;
+    memset( ctx, 0x00, sizeof(zngmf_tab_unload_ex_ctx_t));
+    PFM_TRY( a000_input_check_1 ( itf, ctx) );
+    PFM_TRY( b000_index_check   ( itf, ctx) );
+    PFM_TRY( c000_load          ( itf, ctx) ); 
+    PFM_TRY( d000_rebuild_proc  ( itf, ctx) );
+    return RC_NRM;
+PFM_CATCH:
+    return RC_ERR;
+}
+    static long
+a000_input_check (zngmf_tab_unload_load_ex_t *itf,zngmf_tab_unload_ex_ctx_t *ctx)
+{
+    long  rc = RC_NRM;
+
+    if( itf->job_count > UNLOAD_MAX_JOB )
+    {
+        PFM_ERRS("동시 처리건수가 최대치 20 을 넘었습니다." );
+        set_error_code( 1000, 1002);
+        return RC_ERR;
+    }
+    if( itf->pgmname[0] == NULL )
+    {
+        PFM_ERRS("프로그램명 pgmnam를 확인하세요. pgmnam[%s]", itf->pgmname);
+        set_error_code( 1000, 1002);
+        return RC_ERR;
+    }
+    if( itf->dir[0] == NULL )
+    {
+        PFM_ERRS("작업위치 path를 확인하세요. dir[%s]", itf->dir);
+        set_error_code( 1000, 1002);
+        return RC_ERR;
+    }
+    if( itf->target_db[0] == NULL )
+    {
+        PFM_ERRS("load할 db명을 확인하세요. target_db[%s]", itf->target_db);
+        set_error_code( 1000, 1002);
+        return RC_ERR;
+    }
+    if( itf->target_db[0] == NULL )
+    {
+        PFM_ERRS("load할 db명을 확인하세요. target_db[%s]", itf->target_db);
+        set_error_code( 1000, 1002);
+        return RC_ERR;
+    }
+    if( !strcmp(ctx->target_db,  getenv("REAL_DB")) )
+    {
+        PFM_ERRS("source db와 target db는 같을수 없습니다.");
+        set_error_code( 2000, 2006);
+        return RC_ERR;
+    }
+    /* load db type를 얻어온다 */
+    PFM_TRY( a100_get_load_db_type (itf, ctx));
+    strcpy( target_db_mark,"target_db");
+    return RC_NRM;
+PFM_CATCH:
+    return RC_ERR;
+}
+    static long
+a100_get_load_db_type (zngmf_tab_unload_load_ex_t *itf,zngmf_tab_unload_ex_ctx_t *ctx)
+{
+    long rc = RC_NRM;
+    /* set ctx 값 */
+    strcpy( ctx->target_db      , itf->target_db );
+    strcpy( ctx->input_table    , itf->table     );
+    /* input_table 명칭으로부터 Owner명을 얻어옴 */ 
+    rc = split_ownername( ctx->input_table ,  ctx->owner , ctx->table_name );
+    if( rc != RC_NRM)
+    {
+        return RC_ERR;
+    }
+    ctx->action       = itf->action;
+    ctx->job_count    = itf->job_count;
+    return RC_NRM;
+}
+/*
+ *  파티션을 체크하여 이 파티션이 멀티job이 가능한지를 return 한다.
+ *
+ */
+    static long
+b000_index_check (zngmf_tab_unload_load_ex_t *itf,zngmf_tab_unload_ex_ctx_t *ctx)
+{
+    long rc = RC_NRM;
+    /* global index가 몇개 존재하는냐 정보 */
+    PFM_TRY(b100_global_index_check( ctx ) );
+    /*
+     * action이 truncate이면서 병렬job이 1개 이상이면  append로 변경한다
+     */
+    if( ctx->action == 1 && itf->job_count >= 1)
+    {
+        ctx->action = 2;              /* action를 변경  append로 변경 */
+        ctx->truncate_flag = 1;
+    }
+    else
+    {
+        ctx->truncate_flag = 0;
+    }
+    if( ctx->global_index == 0 )
+    {
+        PFM_DBG("**global index가 없어서 direct로 작업합니다");
+        if( ctx->action == 2 && itf->job_count > 1)  /* append mode만 가능 */
+        {
+            ctx->direct_flag  = 1;
+            ctx->multi_flag   = 1;
+            ctx->rebuild_flag = 1;
+        }
+        else
+        {
+            ctx->direct_flag  = 1;
+            ctx->multi_flag   = 0;
+            ctx->rebuild_flag = 0;
+        }
+    }
+    else
+    {
+        /* global index가 있으면  direct path 는 사용 못한다. */
+        PFM_DBG("** global index가 있어서 index skip mode  false로 작업합니다.");
+        ctx->direct_flag  = 1;
+        ctx->multi_flag   = 1;
+        ctx->rebuild_flag = 1;
+    }
+    return RC_NRM;
+PFM_CATCH:
+    return RC_ERR;
+}
+    static long
+b100_global_index_check( zngmf_tab_unload_ex_ctx_t *ctx )
+{
+    int     is_exist = 0;
+    varchar vs_table_name [100];
+    varchar vs_owner_name [100];
+    memset( &vs_table_name, 0x00, sizeof(vs_table_name));
+    memset( &vs_owner_name, 0x00, sizeof(vs_owner_name));
+    strcpy( (char *)vs_table_name.arr, ctx->table_name);
+    vs_table_name.len = strlen(ctx->table_name);
+    strcpy( (char *)vs_owner_name.arr, ctx->owner);
+    vs_owner_name.len = strlen(ctx->owner);
+    EXEC SQL
+        SELECT /*+ "zngmbcom00020_b100_global_index_check|AAT-프레임워크 공통API" */
+        count(*)          INTO :is_exist
+        FROM ( SELECT 'EXIST'
+                FROM all_part_indexes a,
+                all_tables       b
+                WHERE locality     !='LOCAL'
+                and b.partitioned = 'YES'
+                and b.owner       = UPPER(:vs_owner_name)
+                and b.table_name  = UPPER(:vs_table_name)
+                and b.owner       = a.owner
+                and b.table_name  = a.table_name
+                UNION
+                SELECT 'EXIST'
+                FROM all_indexes c,
+                all_tables  d
+                WHERE c.partitioned = 'NO'
+                and d.owner       = UPPER(:vs_owner_name)
+                and d.table_name  = UPPER(:vs_table_name)
+                and c.table_owner = d.owner
+                and c.table_name  = d.table_name )  ;
+    if( sqlca.sqlcode != 0)
+    {
+        PFM_ERRS("SQL ERROR** global_index check error[%ld:%s]",sqlca.sqlcode,sqlca.sqlerrm.sqlerrmc);
+        return RC_ERR;
+    }
+    if( is_exist > 0)
+        ctx->global_index = 1;
+    else
+        ctx->global_index = 0;
+    return RC_NRM;
+}
+/*
+ *  unload job && load job  수행
+ */
+    static long
+c000_unload_load_proc ( zngmf_tab_unload_load_ex_t *itf,zngmf_tab_unload_ex_ctx_t *ctx )
+{
+    long rc = RC_NRM;
+    long ix = 0;
+    int  state = 0;
+    int  pid;
+    char base_fmt    [100];
+    char ctl_file_fmt[100];
+    char dat_file_fmt[100];
+    char bad_file_fmt[100];
+    char log_file_fmt[100];
+    char currdate    [ 20];
+    char currtime    [ 20];
+    memset( base_fmt    ,0x00,sizeof( base_fmt));
+    memset( ctl_file_fmt,0x00,sizeof( ctl_file_fmt));
+    memset( dat_file_fmt,0x00,sizeof( dat_file_fmt));
+    memset( bad_file_fmt,0x00,sizeof( bad_file_fmt));
+    memset( log_file_fmt,0x00,sizeof( log_file_fmt));
+    memset( currdate,    0x00,sizeof( currdate));
+    memset( currtime,    0x00,sizeof( currtime));
+    /* 시간 set */
+    cal_curr_date( currdate    );
+    cal_curr_time( currtime, 1 );
+    sprintf( base_fmt,     "%s-%s"             , itf->pgmname, itf->table );
+    sprintf( ctl_file_fmt, "%s.%s.%%d"         , base_fmt, "ctl" );
+    sprintf( dat_file_fmt, "%s-%.8s-%.6s%s.%%d", base_fmt, currdate, currtime, ".dat" );
+    sprintf( bad_file_fmt, "%s-%.8s-%.6s%s.%%d", base_fmt, currdate, currtime, ".bad" );
+    sprintf( log_file_fmt, "%s-%.8s-%.6s%s.%%d", base_fmt, currdate, currtime, ".llog");
+    /* ----------------------------------------------------------------------------- */
+    /* truncate이면서 병렬job인 경우는 여기서 trucate하고 모드도 append로 변경시킨다 */
+    /* target 쪽 DB TABLE를 truncate합니다 .                                         */
+    /* ----------------------------------------------------------------------------- */
+    if( ctx->truncate_flag  == 1 )
+    {
+        rc = c001_target_table_truncate( itf, ctx);
+        if( rc != RC_NRM)
+        {
+            return RC_ERR;
+        }
+        PFM_DBG("타겟 TABLE(%s) 먼저 TRUNCATE 하면서 작업합니다. ", ctx->input_table);
+    }
+    PFM_DBG("***  direct_flag  [%d]",   ctx->direct_flag );
+    PFM_DBG("***  multi_flag   [%d]",   ctx->multi_flag  );
+    PFM_DBG("***  rebuild_flag [%d]",   ctx->rebuild_flag);
+    PFM_DBG("***  truncate_flag[%d]",   ctx->truncate_flag);
+    for ( ix = 0; ix < itf->job_count ; ix++ )
+    {
+        /*
+         * data파일, ctl파일, bad파일, log파일을 set한다.
+         */
+        sprintf( itf->job[ix].ctl_file,ctl_file_fmt, ix +1 );
+        sprintf( itf->job[ix].dat_file,dat_file_fmt, ix +1 );
+        sprintf( itf->job[ix].bad_file,bad_file_fmt, ix +1 );
+        sprintf( itf->job[ix].log_file,log_file_fmt, ix +1 );
+        sprintf( itf->job[ix].ctl_filename,"%s/%s", itf->dir,itf->job[ix].ctl_file );
+        sprintf( itf->job[ix].dat_filename,"%s/%s", itf->dir,itf->job[ix].dat_file );
+        sprintf( itf->job[ix].bad_filename,"%s/%s", getenv("LOGBAT"), itf->job[ix].bad_file);
+        sprintf( itf->job[ix].log_filename,"%s/%s", getenv("LOGBAT"), itf->job[ix].log_file);
+        sprintf( itf->job[ix].dir         ,"%s"   , itf->dir    );
+        sprintf( itf->job[ix].table       ,"%s"   , itf->table  );
+        /*  sprintf( itf->job[ix].partition   ,"%s"   , itf->partition  ); */
+        /*  sprintf( itf->job[ix].ld_type     ,"%s"   , ctx->ld_type);     */
+        itf->job[ix].action = ctx->action;
+        if(  ctx->direct_flag == 1 )
+        {
+            sprintf( itf->job[ix].ld_type, "%s", "DIRECT=TRUE ");
+        }
+        else
+        {
+            sprintf( itf->job[ix].ld_type, "%s", " ");
+        }
+        if( ctx->multi_flag == 1)
+        {
+            strcat ( itf->job[ix].ld_type, "parallel=true skip_index_maintenance=true ");
+        }
+        if( ctx->direct_flag == 0 || ctx->multi_flag == 0)
+        {
+            strcat ( itf->job[ix].ld_type, "rows=1000000 " );
+        }
+        rc = c100_child_proc( &itf->job[ix], ctx );
+        if( rc != RC_NRM)
+        {
+            PFM_ERRS( ">>> TABLE UNLOAD중 에러가 발생했습니다.[%ld]", rc );
+            return RC_ERR;
+        }
+        itf->job[ix].pid = rc;
+    }
+    /*
+     * calling한 프로세세스가 child의 process group id와 같을 동안 대기한다.
+     */
+    while( (pid = waitpid( 0, &state, 0 )) != -1 )
+    {
+        PFM_DBG( "child process return pid ....waitpid[%ld] status[%d]", pid, WEXITSTATUS(state));
+        if ( WSTOPSIG(state ))
+        {
+            PFM_ERRS(" child에서 stop signal 발생 !!!");
+            return RC_ERR;
+        }
+        else if( WCOREDUMP(state))
+        {
+            PFM_ERRS(" child에서 core signal 발생 !!!");
+            return RC_ERR;
+        }
+        else if( WIFSTOPPED(state) || WTERMSIG(state) )
+        {
+            PFM_ERRS(" child에서 term signal 발생 !!!");
+            return RC_ERR;
+        }
+    }
+    return RC_NRM;
+}
+ 
+/*
+ *  child 처리
+ */
+    static long
+c100_child_proc( zngmf_tab_unload_load_ex_sub_t *job,zngmf_tab_unload_ex_ctx_t *ctx )
+{
+    long rc = RC_NRM;
+    int  iserr = 0;
+    int  pid   = 0;
+    /*
+       (void)signal( SIGCHLD, waitchild);
+     */
+    switch( pid = fork() )
+    {
+        case 0:   /* child */
+            rc = c101_child_fork_proc( job, ctx );
+            if( rc != RC_NRM)
+            {
+                PFM_ERRS("child fork process 에러 !!![%ld] 종료 exit", rc);
+                set_error_code( 1000, 1501);
+                exit( -1 );
+            }
+            PFM_DBG("<<<<<<<  CHILD PROCESS 종료 [pid = %ld] exit...[%ld] >>>>>>>", getpid(), rc );
+            exit(0);
+        default:    /* parent */
+            /* child가 끝나기를 기다린다===> 이렇게 되면 child 종료 싯점을 알수 없다. */
+            // waitpid( pid, &iserr, WNOHANG);
+            return RC_NRM;
+        case -1:
+            return RC_ERR;
+    }
+    return RC_NRM;
+}
+    static long
+c101_child_fork_proc( zngmf_tab_unload_load_ex_sub_t *job,zngmf_tab_unload_ex_ctx_t *ctx )
+{
+    long rc = RC_NRM;
+    int   parallel_gb;
+    rc = c110_connection( );
+    if( rc != RC_NRM)
+    {
+        PFM_ERRS("CHILD CONNECTION 연결에러 [%ld]", rc );
+        return RC_ERR;
+    }
+    PFM_DBG("dat_file [%s]",job->dat_file );
+    PFM_DBG("ctl_file [%s]",job->ctl_file );
+    PFM_DBG("partition[%s]",job->partition );
+    PFM_DBG("table    [%s]",job->table    );
+    PFM_DBG("where_str[%s]",job->where_str);
+    PFM_DBG("dir      [%s]",job->dir      );
+    PFM_DBG("action   [%d]",job->action   );
+    /* ------------------------------------------------------------- */
+    /* 1. partition 이 없는 경우        parallel_gb 1 => parallel 24 */
+    /* 2. partition 이 1개 있는 경우    parallel_gb 2 => parallel 24 */
+    /* 3. partition 이 n개 있는 경우    parallel_gb 3 => parallel  4 */
+    /* ------------------------------------------------------------- */
+    if( job->partition[0] ==  NULL)
+    {
+        parallel_gb  = 1;
+    }
+    if( ctx->job_count <= 1)
+    {
+        if( job->partition[0] == NULL)
+        {
+            parallel_gb  = 1;
+        }
+        else
+        {
+            parallel_gb  = 2;
+        }
+    }
+    if( ctx->job_count > 1 )
+    {
+        if( job->partition[0] == NULL)
+        {
+            parallel_gb  = 1;
+        }
+        else
+        {
+            parallel_gb  = 3;
+        }
+    }
+    PFM_DBG("parallel 처리 구분이 %d 입니다." ,parallel_gb );
+    rc = desc_and_process_tbl(
+            job->dat_file,
+            job->partition,
+            job->ctl_file,
+            job->table,
+            job->where_str,  /* where string              */
+            "",              /* order by                  */
+            1048576,         /* 1024*1024 1Mega  io write */
+            "",              /* index_name_with_owner     */
+            2,               /* variable format           */
+            job->dir,        /* path정보                  */
+            job->action , parallel_gb );
+    if( rc != RC_NRM )
+    {
+        PFM_ERRC("unload오류 발생 !! ctl_file[%s] rc[%ld]",job->ctl_file, rc);
+        return RC_ERR;
+    }
+    rc = c120_normal_end();
+    if( rc != RC_NRM)
+    {
+        PFM_ERRS("CHILD CONNECTION 종료 처리 에러 [%ld]", rc );
+        return RC_ERR;
+    }
+    PFM_DBG(" File 생성  FROM DB(%s) ....생성[%s]", job->table, job->dat_file );
+    rc = c300_load_proc( job, ctx );
+    if( rc != RC_NRM)
+    {
+        PFM_ERRS("CHILD LOAD 에러 !!![%ld]", rc );
+        return RC_ERR;
+    }
+    PFM_DBG(" LOAD TO  DB( %s) SUCCESS.... ", job->table );
+    return RC_NRM;
+}
+/*
+ * DB connection
+ */
+    static long
+c110_connection()
+{
+    long rc = RC_NRM;
+    char  conn_info[100];
+    memset( conn_info, 0x00, sizeof(conn_info));
+    /* 오라클 DATABASE 연결 */
+    ngmf_get_dbinfo_ex( "TYPE_A", getenv("REAL_DB"), conn_info );
+    rc = connect_to_oracle( conn_info);
+    if( rc != RC_NRM )
+    {
+        PFM_ERRS( ">>> 오라클 연결실패입니다.!!![%ld]", rc);
+        set_error_code( 1000, 1101);
+        return RC_ERR;
+    }
+    /* CURSOR OPEN */
+    rc = open_cursor();
+    if( rc != RC_NRM)
+    {
+        PFM_ERRS( ">>> open_cursor 오류입니다.[%ld]", rc );
+        set_error_code( 1000, 1102);
+        return RC_ERR;
+    }
+    return RC_NRM;
+}
+/*
+ *  종료 -- cursor 종료 / db 종료
+ */
+    static long
+c120_normal_end()
+{
+    long rc = RC_NRM;
+    /* CURSOR CLOSE */
+    rc = close_cursor();
+    /* DB연결 종료 */
+    rc = logoff_from_oracle();
+    return RC_NRM;
+}
+/*
+ *  load job
+ */
+    static long
+c300_load_proc( zngmf_tab_unload_load_ex_sub_t *job,zngmf_tab_unload_ex_ctx_t *ctx)
+{
+    long  rc    = RC_NRM;
+    char  cmd_line [1024];
+    int   iserr      = 0;
+    long  move_flag  = 0;
+    char  conn_info [512];
+    long  ix         = 0;
+    char  *ptr_a = NULL;
+    char  *ptr_b = NULL;
+    char  *ptr_c = NULL;
+    char  *ptr_d = NULL;
+    memset( cmd_line, 0x00, sizeof( cmd_line));
+    /* db connection type를 구해온다 */
+    rc = get_target_type (ctx );
+    ngmf_get_dbinfo_ex   ( ctx->target_type, ctx->target_db, conn_info );
+    PFM_DBG("TARGET_TYPE [%s]", ctx->target_type );
+    sprintf( cmd_line, "sqlldr control=%s data=%s bad=%s log=%s %s errors=1000000000 "
+            "bindsize=2048000 readsize=2048000 silent=header,feedback"
+            "<<EOF\n%s\nEOF",
+            job->ctl_filename,
+            job->dat_filename,
+            job->bad_filename,
+            job->log_filename,
+            job->ld_type     , conn_info );
+
+    PFM_DBG(">>LOAD CMD[sqlldr control=%s data=%s bad=%s log=%s %s",
+            job->ctl_filename,
+            job->dat_filename,
+            job->bad_filename,
+            job->log_filename,
+            job->ld_type );
+
+    /* PFM_DBG(">>>>>LOAD CMD[%.100s]",cmd_line); */
+    iserr = system( cmd_line );
+    if( iserr != RC_NRM)
+    {
+        rc = c310_err_exit_proc( ctx,job,iserr );
+        if( rc  != RC_NRM )
+        {
+            return RC_ERR;
+        }
+    }
+    /*  BAD 파일 존재 여부 검사 ...*/
+    PFM_DBG(" BAD 파일 존재 여부 검사 ... ");
+    rc =  check_bad_file( job->bad_filename);
+    if( rc == RC_NRM)
+    {
+        PFM_ERRS("*** BAD 파일이 존재하지만 정상진행합니다.BAD를 확인하세요.[%s] ***",job->bad_filename);
+        set_error_code( 9000, 9001);
+        return RC_NRM; /* 정상 진행 */
+    }
+    return RC_NRM;
+}
+
+    static long
+c310_err_exit_proc( zngmf_tab_unload_ex_ctx_t *ctx,zngmf_tab_unload_load_ex_sub_t *job,int iserr )
+{
+    if( WIFEXITED( iserr ))
+    {
+        if ( WEXITSTATUS( iserr ) == 1)
+        {
+            PFM_DSP( "SQLLDR 에서 다음 signal이 발생했습니다.signal 값 =%d", WEXITSTATUS( iserr ));
+            PFM_DBG( ">>>>로그[%s]를 확인하세요.+++정상처리 합니다. +++",job->log_filename );
+            set_error_code( 9000, 9002);
+            return  RC_NRM;   /* 정상 */
+        }
+        else if ( WEXITSTATUS( iserr ) == 2)
+        {
+            PFM_DBG( "+++정상처리합니다.+++",job->log_filename);
+            return  RC_NRM;
+        }
+        else
+        {
+            PFM_DSP( "SQLLDR 에서 다음 signal이 발생했습니다.signal 값 =%d", WEXITSTATUS( iserr ));
+            PFM_ERRS( "SQLLDR 비정상 종료합니다.");
+            set_error_code( 2000, 2005);
+            return RC_ERR;
+        }
+    }
+    else if ( WIFSIGNALED( iserr))
+    {
+        PFM_ERRS( "SQLLDR 에서 다음 오류 signal이 발생했습니다. signal = %d%s", WTERMSIG( iserr ),
+#ifdef WCOREDUMP
+                WCOREDUMP( iserr ) ? " (core file gen) " : "");
+#else
+        "" );
+#endif
+        PFM_ERRS(  "======== 종료 !! ( core )======= ");
+        set_error_code( 2000, 2003);
+        return RC_ERR;
+    }
+    else if ( WIFSTOPPED ( iserr ))
+    {
+        PFM_ERRS( " sqlldr  stop  signal number = %d", WSTOPSIG( iserr ));
+        PFM_ERRS( " ======== 종료 ( signal  ) =========== ");
+        set_error_code( 2000, 2004);
+        return RC_ERR;
+    }
+    else
+    {
+        PFM_ERRS( "====== 정의되지 않은 signal!!! ( %d ) ====== ",iserr);
+        set_error_code( 2000, 2005);
+        return RC_ERR;
+    }
+    return RC_ERR;
+}
+    static void
+waitchild( int sigid )
+{
+    long            iserr;
+    long            waitcount = 0;
+    union wait      status;
+    long            flag = 1;
+    while( flag )
+    {
+        iserr = wait3( ( int *)&status, WNOHANG, ( struct rusage *)0);
+        if( iserr <= 0) break;
+        PFM_DBG( "wait3 terminated child process ... status=[%X]", iserr, status);
+        if( waitcount++ > 10) break;
+    }
+    ( void)signal( SIGCHLD, waitchild);
+}
+/*-----------------------------------------------------------------------------------------------------------*/
+/*-----------------------------------------------------------------------------------------------------------*/
+/*
+ *  truncate인 경우 target_table truncate
+ */
+    static long
+c001_target_table_truncate( zngmf_tab_unload_load_ex_t *itf ,zngmf_tab_unload_ex_ctx_t *ctx)
+{
+    long rc = RC_NRM;
+    long ix = 0;
+    char qry_str[1024];
+    char conn_info[1024];
+    memset( qry_str, 0x00, sizeof( qry_str));
+    memset( conn_info, 0x00, sizeof( conn_info));
+    rc = get_target_type( ctx);
+    ngmf_get_dbinfo_ex( ctx->target_type, ctx->target_db, conn_info );
+    if( conn_info[0] == NULL )
+    {
+        PFM_ERRS("target db 정보를 얻지 못했습니다. ( 암호화 오류 )");
+        set_error_code( 2000, 2001);
+        return RC_ERR;
+    }
+
+    rc = mpfmdbio_open_instance( conn_info ,target_db_mark );
+    if( rc != RC_NRM)
+    {
+        PFM_ERRS("target db connection fail !!![%ld:%s]",sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+        set_error_code( 2000, 2001);
+        return RC_ERR;
+    }
+    for( ix = 0; ix < itf->job_count ; ix++ )
+    {
+        if( itf->job[ix].partition[0] != NULL)
+        {
+            sprintf( qry_str ,"alter table %s.%s truncate partition  %s  ", ctx->owner,ctx->table_name, itf->job[ix].partition );
+            PFM_DBG("TRUNCATE PARTITION [%s]", qry_str);
+            EXEC SQL AT :target_db_mark EXECUTE IMMEDIATE :qry_str;
+            if( sqlca.sqlcode != 0)
+            {
+                PFM_ERRS("truncate 에러  (1) !!![%d:%s]",sqlca.sqlcode,sqlca.sqlerrm.sqlerrmc);
+                set_error_code( 2000, 2007);
+                mpfmdbio_close_instance( target_db_mark);
+                return RC_ERR;
+            }
+        }
+        else
+        {
+            if( ix == 0)
+            {
+                sprintf( qry_str ,"truncate table %s.%s ", ctx->owner,ctx->table_name );
+                PFM_DBG("TRUNCATE TABLE [%s]", qry_str);
+                EXEC SQL AT :target_db_mark EXECUTE IMMEDIATE :qry_str;
+                if( sqlca.sqlcode != 0)
+                {
+                    PFM_ERRS("truncate 에러 (2) !!![%d:%s]",sqlca.sqlcode,sqlca.sqlerrm.sqlerrmc);
+                    set_error_code( 2000, 2007);
+                    mpfmdbio_close_instance( target_db_mark);
+                    return RC_ERR;
+                }
+            }
+        }
+    }
+    mpfmdbio_close_instance( target_db_mark);
+    return RC_NRM;
+}
+
+    static long
+get_target_type(zngmf_tab_unload_ex_ctx_t *ctx)
+{
+    long rc = RC_NRM;
+    char  *ptr_a = NULL;
+    char  *ptr_b = NULL;
+    char  *ptr_c = NULL;
+    char  *ptr_d = NULL;
+    /* 환경변수 값을 먼저 CHECK한다. */
+    ptr_a = getenv("ARCH_DB");
+    ptr_b = getenv("TERM_DB");
+    ptr_c = getenv("PROB_DB");
+    ptr_d = getenv("SALE_DB"); /* 1차결산서버 */
+    /* 통계DB  */
+    if( (ptr_a != NULL) && (!strcmp( ctx->target_db, ptr_a)) )
+    {
+        strcpy( ctx->target_type, "TYPE_B");
+    }
+    /* 해지고객DB */
+    if( (ptr_b != NULL) && (!strcmp( ctx->target_db, ptr_b)) )
+    {
+        strcpy( ctx->target_type, "TYPE_C");
+    }
+    /* 개발서버/STAGING/PRODUCTION에 따라 달라짐. */
+    if( (ptr_c != NULL) && (!strcmp( ctx->target_db, ptr_c)) )
+    {
+        strcpy( ctx->target_type, "TYPE_A");
+    }
+    /* 일괄배치서버 */
+    if( (ptr_d != NULL) && (!strcmp( ctx->target_db, ptr_d)) )
+    {
+        strcpy( ctx->target_type, "TYPE_A");
+    }
+    /* PROB_DB환경변수를 이용하지 않고, NGMS2, NGMP4 사용했을 때 아래 로직 타야 함 */
+    if( ptr_a == NULL && ptr_b == NULL && ptr_c == NULL && ptr_d == NULL )
+    {
+        strcpy( ctx->target_type, "TYPE_A");
+    }
+    return RC_NRM;
+}
+/*
+ *  index복원 작업
+ */
+    static long
+d000_rebuild_proc    (zngmf_tab_unload_load_ex_t *itf,      zngmf_tab_unload_ex_ctx_t *ctx)
+{
+    long    rc = RC_NRM;
+    char    conn_info[1024];
+    /* ------------------------------------ */
+    /* rebuild skip                         */
+    /* ------------------------------------ */
+    if( ctx->rebuild_flag != 1) return RC_NRM;
+
+    memset( conn_info, 0x00, sizeof( conn_info));
+    rc = get_target_type( ctx);
+    ngmf_get_dbinfo_ex( ctx->target_type, ctx->target_db, conn_info );
+    if( conn_info[0] == NULL)
+    {
+        PFM_ERRS("target 정보  info 에러 (암호화 모듈 확인 필요 )!!!");
+        set_error_code( 2000, 2001);
+        return RC_ERR;
+    }
+    rc = mpfmdbio_open_instance( conn_info ,target_db_mark);
+    if( rc != RC_NRM)
+    {
+        PFM_ERRS("target db connection fail !!![%ld:%s]",sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+        set_error_code( 2000, 2001);
+        return RC_ERR;
+    }
+    /* ------------------------------------ */
+    /* rebuild 작업 시작                    */
+    /* ------------------------------------ */
+    PFM_TRYNJ( d100_index_rebuild( itf, ctx ) );
+    if( rc != RC_NRM)
+    {
+        set_error_code( 9000, 9003);
+    }
+    mpfmdbio_close_instance( target_db_mark );
+
+    return RC_NRM;
+PFM_CATCH:
+    return RC_ERR;
+}
+/* rebuild 수행 후에 source의 connection를 복원시켜 준다 */
+    static long
+e000_source_connect()
+{
+    long    rc = RC_NRM;
+    char    conn_info[1024];
+    memset( conn_info, 0x00, sizeof( conn_info));
+    ngmf_get_dbinfo_ex( "TYPE_A", getenv("REAL_DB"), conn_info );
+    if( conn_info[0] == NULL)
+    {
+        PFM_ERRS("source 정보  info 에러 (암호화 모듈 확인 필요 )!!!");
+        return RC_ERR;
+    }
+    /* connection */
+    rc= mpfmdbio_open( conn_info );
+    if( rc != RC_NRM)
+    {
+        PFM_ERRS("source db connection fail !!![%ld:%s]",sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+        return RC_ERR;
+    }
+    return RC_NRM;
+}
+/*
+ *  REBULD 용 INDEX용
+ */
+    static long
+d100_index_rebuild( zngmf_tab_unload_load_ex_t *itf, zngmf_tab_unload_ex_ctx_t *ctx)
+{
+    long rc = RC_NRM;
+    long ix = 0;
+    varchar vs_table_name [100];
+    varchar vs_owner_name [100];
+    varchar index_name    [200];
+    varchar index_type    [200];
+    varchar part_name     [200];
+    varchar status        [200];
+    char    sqlstr        [512];
+
+    memset( &vs_table_name, 0x00, sizeof(vs_table_name));
+    memset( &vs_owner_name, 0x00, sizeof(vs_owner_name));
+    strcpy( (char *)vs_table_name.arr, ctx->table_name);
+    vs_table_name.len = strlen(ctx->table_name);
+    strcpy( (char *)vs_owner_name.arr, ctx->owner);
+    vs_owner_name.len = strlen(ctx->owner);
+    PFM_DBG("**인덱스 복원 작업 시작 *!!! owner[%s] table_name[%s]", ctx->owner, ctx->table_name);
+    /* 인덱스 rebuild 성능을 향상시키기 위한 명령어들 */
+    //EXEC SQL AT :target_db_mark alter session set workarea_size_policy = manual;
+    //EXEC SQL AT :target_db_mark alter session set sort_area_size = 104857600;
+    //EXEC SQL AT :target_db_mark alter session set hash_area_size = 104857600;
+    EXEC SQL AT :target_db_mark alter session set workarea_size_policy = auto;    /* Ukey 2.0 권고안 */
+    /* 청구 parallel 속도향상을 위한 문장 추가 */
+    EXEC SQL AT :target_db_mark alter session set db_file_multiblock_read_count = 128;
+    EXEC SQL AT :target_db_mark DECLARE index_cur CURSOR  FOR
+        select /*+ "zngmbcom00020_d100_index_rebuild|AAT-프레임워크 공통API" */
+        v1.owner || '.' || v1.index_name index_nm,
+        v1.index_type,
+        decode(v1.index_type,'GLOBAL', v1.status, d.status) status,
+        decode(v1.index_type,'GLOBAL', '', v1.partition_name) part_name
+            from
+            (select a.owner, a.table_name, a.index_name, a.partitioned, a.status,
+             decode(b.index_name, null, 'GLOBAL', 'LOCAL') index_type,
+             c.partition_name
+             from all_indexes a, all_part_indexes b, all_tab_partitions c
+             where a.owner      = UPPER( :vs_owner_name)
+             and   a.table_name = UPPER( :vs_table_name)
+             and   a.owner      = b.owner(+)
+             and   a.index_name = b.index_name(+)
+             and   a.table_name = c.table_name(+)
+            ) v1,
+        all_ind_partitions d
+            where v1.owner          = d.index_owner(+)
+            and   v1.index_name     = d.index_name(+)
+            and   v1.partition_name = d.partition_name(+)
+            group by v1.owner || '.' || v1.index_name,
+        v1.index_type,
+        decode(v1.index_type,'GLOBAL', v1.status, d.status),
+        decode(v1.index_type,'GLOBAL', '', v1.partition_name)
+            order by index_nm, index_type, decode(v1.index_type,'GLOBAL', '', v1.partition_name);
+
+    EXEC SQL AT :target_db_mark OPEN index_cur;
+    if( sqlca.sqlcode != 0)
+    {
+        PFM_ERRS("SQL ERROR** INDEX REBUILD OPEN 에러[%ld:%s]",sqlca.sqlcode,sqlca.sqlerrm.sqlerrmc);
+        return RC_ERR;
+    }
+    for(;;)
+    {
+        memset( &index_name    , 0x00, sizeof( index_name));
+        memset( &index_type    , 0x00, sizeof( index_type));
+        memset( &status        , 0x00, sizeof( status));
+        memset( &part_name     , 0x00, sizeof( part_name));
+        memset( sqlstr         , 0x00, sizeof( sqlstr));
+        EXEC SQL AT :target_db_mark FETCH index_cur INTO :index_name, :index_type, :status, :part_name;
+        if( sqlca.sqlcode == 1403 ) break;
+        if( sqlca.sqlcode != 0 )
+        {
+            PFM_ERRS("SQL ERROR** INDEX REBUILD FETCH 에러 [%ld:%s]",sqlca.sqlcode,sqlca.sqlerrm.sqlerrmc);
+            EXEC SQL AT :target_db_mark CLOSE index_cur;
+            return RC_ERR;
+        }
+        if( !strcmp( status.arr,"UNUSABLE"))
+        {
+     /*  청구 parallel up 처리시는 값이 8~12 ,일반처리시는 변수에값없음 */
+     if (gl_com00020_parallel_cnt   <   8   ||
+  gl_com00020_parallel_cnt   >  32)
+            {
+  gl_com00020_parallel_cnt   =   8;
+     }
+            PFM_DBG("** index parallel cnt : gl_com00020_parallel_cnt = %ld", gl_com00020_parallel_cnt);
+            if( !strcmp( index_type.arr , "LOCAL"))
+            {
+                PFM_DBG( "local index build [%s][%s][%s]", index_name.arr, index_type.arr, part_name.arr);
+  /* 청구 parallel up 처리로 인한 degree 부분 수정 */
+                //sprintf( sqlstr ,"alter index %s rebuild partition %s nologging parallel (degree 8)",
+                //        index_name.arr,part_name.arr) ;
+                sprintf( sqlstr ,"alter index %s rebuild partition %s nologging parallel (degree %ld)",
+                        index_name.arr,part_name.arr, gl_com00020_parallel_cnt) ;
+    
+                EXEC SQL AT :target_db_mark EXECUTE IMMEDIATE :sqlstr;
+                if( sqlca.sqlcode != 0)
+                {
+                    PFM_ERRS("SQL ERROR** local rebuild_index 에러 확인하세요++정상진행합니다.++[%ld:%s]",
+                            sqlca.sqlcode,sqlca.sqlerrm.sqlerrmc);
+                    set_error_code( 9000, 9003);
+                }
+            }
+            else if (!strcmp(index_type.arr ,"GLOBAL"))
+            {
+                PFM_DBG( "global index build [%s][%s]", index_name.arr, index_type.arr);
+   
+  /* 청구 parallel up 처리로 인한 degree 부분 수정 */
+                //sprintf( sqlstr, "alter index %s rebuild nologging parallel (degree 8)", index_name.arr);
+                sprintf( sqlstr, "alter index %s rebuild nologging parallel (degree %ld)",index_name.arr, gl_com00020_parallel_cnt);
+   
+                EXEC SQL AT :target_db_mark EXECUTE IMMEDIATE :sqlstr;
+                if( sqlca.sqlcode != 0)
+                {
+                    PFM_ERRS("SQL ERROR** global rebuild_index 에러 확인하세요++정상진행합니다.++[%ld:%s]",
+                            sqlca.sqlcode,sqlca.sqlerrm.sqlerrmc);
+                    set_error_code( 9000, 9003);
+                }
+            }
+            /* 인덱스 생성후, logging noparallel로 다시 변경해주어야 함  -- 20061009 */
+            memset( sqlstr, 0x00, sizeof(sqlstr));
+            sprintf( sqlstr ,"alter index %s logging noparallel", index_name.arr);
+            EXEC SQL AT :target_db_mark EXECUTE IMMEDIATE :sqlstr;
+            if( sqlca.sqlcode != 0)
+            {
+                PFM_ERRS("SQL ERROR** index %s logging noparallel 모드 전환에 실패했습니다. [%ld:%s]", index_name.arr,
+                        sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+            }
+        }
+    }
+    EXEC SQL AT :target_db_mark CLOSE index_cur;
+    PFM_DBG("**인덱스 복원 작업 종료 *!!!");
+    return RC_NRM;
+}
+
+/* 주어진 table명에서 owner와 table명 분리 */
+    static long
+split_ownername( char *longtable , char *owner, char *table)
+{
+    long rc = RC_NRM;
+    long len  = 0;
+    long i    = 0;
+    long find = 0;
+    varchar v_owner[100];
+    varchar v_user [100];
+    memset( &v_owner, 0x00, sizeof(v_owner));
+    memset( &v_owner, 0x00, sizeof(v_user));
+    len = strlen(longtable);
+    for( i= 0; i< len ; i++)
+    {
+        if( longtable[i] == '.')
+        {
+            find = 1;
+            break;
+        }
+    }
+    /* find=1 : input table 명칭 안에 owner명이 있는 경우 */
+    if( find )
+    {
+        strncpy( owner , &longtable[0]  , i );
+        strcpy ( table , &longtable[i+1]    );
+    }
+    else
+    {
+        EXEC SQL SELECT user INTO :v_user FROM dual ;
+        EXEC SQL
+            SELECT /*+ "zngmbcom00020_split_ownername|AAT-프레임워크 공통API" */
+            c.table_owner into :v_owner 
+            FROM    all_synonyms c,
+                    (SELECT owner, object_name
+                     FROM   all_objects
+                     WHERE  object_type = 'SYNONYM'
+                     AND    owner       = :v_user
+                     AND    status      = 'VALID') d
+                        WHERE  c.owner       = d.owner
+                        AND    c.table_name  = d.object_name
+                        AND    c.table_name  = UPPER(:longtable);
+        if( sqlca.sqlcode != 0)
+        {
+            PFM_ERRS("SQL ERROR** dba_tables select 에러 [%s] [%d:%s]",longtable, sqlca.sqlcode,sqlca.sqlerrm.sqlerrmc);
+            return RC_ERR;
+        }
+        strcpy( owner, v_owner.arr);
+        strcpy( table, longtable);
+    }
+    return RC_NRM;
+}
+/* 파일이 존재하면 정상 return */
+    static long
+check_bad_file( char *filename  )
+{
+    long rc = RC_NRM;
+    rc = access( filename,F_OK);
+    if( rc != 0)
+    {
+        return RC_ERR;
+    }
+    return RC_NRM;
+}
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+/*
+ * Function : close_cursor
+ * Summary  : Close all cursor's of the program (in fact only one)
+ * Input    :
+ * Output   : ---
+ */
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+    static long
+close_cursor()
+{
+    /* Close the cursor. */
+    if (oclose(&(g_cursor)))
+    {
+        PFM_ERRS("Error at closing cursor:");
+        handle_oracle_error(&(g_cursor));
+        return RC_ERR;
+    }
+    return RC_NRM;
+}
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+/*
+ * Function : connect_to_oracle
+ * Summary  : Establish a connection to the Oracle RDBMS
+ * Input    : 1. Pointer to Oracle username/password@connectstring
+ * Output   : ---
+ */
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+    static long
+connect_to_oracle( char *p_userpass)
+{
+    if (orlon(&lda
+                ,hda
+                ,(text *)p_userpass              /* full connect-string. */
+                ,OCI_NULL_TERMINATED_STR
+                ,NULL                           /* password should be in p_userpass */
+                ,OCI_NULL_TERMINATED_STR
+                ,(text *) OCI_PARAMETER_NOT_USED
+             )
+       )
+    {
+        handle_oracle_error((Cda_Def *) &lda);   /* lda is same as cda */
+        return RC_ERR;
+    }
+    PFM_DBG("Connected... OK ");
+    return RC_NRM;
+}
+
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+/*
+ * Function : create_control_file
+ * Summary  : create the control file and writes first part
+ *            of info in it.
+ * Modify   : Add an infile option by Byoung-kwon Moon
+ * Input    : 1. FILE pointer
+ *            2. Pointer to name of file
+ *            3. Pointer to (optional) order by clause
+ *            4. Name of index to pre-sort data
+ *            5. Formaat-aanduiding:
+ *               VARIABLE_FORMAT of FIXED_FORMAT
+ *            6. Name of table
+ *
+ * Output   : ---
+ * Return   : FILE pointer to outfile (is controlfile)
+ */
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+static FILE *create_control_file
+(
+ FILE *p_outf
+ ,char *p_outf_name
+ ,char *p_ctl_name
+ ,char *p_order_by
+ ,char *p_index_name_with_owner
+ ,int   p_which_format
+ ,char *p_prt_name
+ ,char *p_table_name
+ ,char *mid
+ ,int   action
+ )
+{
+    char controlfile_name[257];
+    sprintf(controlfile_name, "%s/%s", mid, p_ctl_name);
+    if ((p_outf = fopen(controlfile_name, "w")) == NULL)
+    {
+        PFM_DBG ("Control file %s could not be opened.", controlfile_name);
+        return NULL;
+    }
+    fprintf( p_outf, "LOAD DATA\n");
+    fprintf( p_outf, "INFILE '%s' \"str '|\\n'\"\n" , p_outf_name );
+    /* for truncation data */
+    if( action == 1 )
+    {
+        fprintf( p_outf, "TRUNCATE \n" );
+    }
+    else if( action == 2 )
+    {
+        fprintf( p_outf, "APPEND \n" );
+    }
+    else if( action == 3 )
+    {
+        fprintf( p_outf, "REPLACE \n" );
+    }
+    else if( action == 4 )
+    {
+        fprintf( p_outf, "INSERT \n" );
+    }
+    else
+    {
+        fprintf( p_outf, "APPEND \n" );
+    }
+    fprintf(p_outf, "INTO TABLE %s\n", p_table_name);
+    /* +++ for partition */
+    if( p_prt_name[0] != NULL ) /* if partition name exist */
+    {
+        fprintf( p_outf, "PARTITION ( %s ) \n", p_prt_name );
+    }
+    fflush(p_outf);
+    if ( ((int) strlen(p_index_name_with_owner) > 0)
+            &&
+            ((int) strlen(p_order_by) > 0)
+       )
+        fprintf(p_outf, "SORTED INDEXES (%s)\n", p_index_name_with_owner );
+    if (p_which_format == VARIABLE_FORMAT)
+        fprintf(p_outf
+                ,"FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '\"'\n"
+               );
+    fprintf(p_outf, "TRAILING NULLCOLS\n");
+    return(p_outf);
+}
+/* --------------------------------------- function body -----------------------------------------------------------------------*/
+/*
+ * Function : desc_and_process_tbl
+ * Summary  : Describes the table and writes data-file.
+ * Input    : 1. Name of output file
+ *               (for both control and data)
+ *            2. Pointer to name of table
+ *            3. Pointer to where-clause
+ *            4. Pointer to (optional) order by clause
+ *            5. Size of buffer for array fetching
+ *            6. Name of index to pre-sort data
+ *            7. Formaat-aanduiding:
+ *               VARIABLE_FORMAT of FIXED_FORMAT
+ *
+ * Output   : ---
+ */
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+static long
+desc_and_process_tbl
+(
+ char *p_outf_name
+ , char *p_prt_name
+ , char *p_ctl_name
+ , char *p_table_name
+ , char *p_rest
+ , char *p_order_by
+ , int   p_array_buffer_size
+ , char *p_index_name_with_owner
+ , int   p_which_format
+ , char *mid
+ , int   action
+ , int   parallel_gb
+ )
+{
+    int  position = 1;              /* Start pos. of columns in data-file
+                                     * in case of fixed format.             */
+    sb4  dbsize;                    /* Max. size of column in DD            */
+    sb2  dbtype;                    /* internal datatype code               */
+    sb4  dsize;                     /* Maximum display size                 */
+    sb2  prec          = 0;         /* no interest in precision             */
+    sb2  scale         = 0;         /* no interest in scale                 */
+    sb2  nullok        = 0;         /* no interest in null-ok's             */
+    int  rowsize       = 0;         /* total size for a row in bytes        */
+    int  col_nm_size = 30;          /* Max size of length of column name    */
+    char col_nm[MAX_OBJECT_LEN];    /* String for holding column_name       */
+    char select_text[1024];         /* String for holding select.           */
+    int  number_of_columns;         /* Number of column of table/view       */
+    int  array_size;                /* Number of rows per fetch-call        */
+    char  *column[MAX_COLUMNS];     /* Array of pointers for column-values  */
+    short *ind_col[MAX_COLUMNS];    /* Array of pointers for indicators     */
+    short  col_type[MAX_COLUMNS];   /* Array of column-types                */
+    short  col_len[MAX_COLUMNS];    /* Array of maximum column-lengths      */
+    short *col_rlen[MAX_COLUMNS];   /* Array of column real-lengths         */
+    char   df_name[257];             /* Name of datafile                     */
+    FILE   *outfile;                  /* pointer for control- and data-file   */
+    long   rows_printed = 0;         /* Number if rows which have been print */
+    char   df_buffer[df_bufferSIZE];  /* Pointer for buffering output data    */
+    int    i;
+    long  col_length = 0;
+    long  rc =0;
+    char  col_tmp[512];
+
+    PFM_DBG("desc_and_process_tbl:");
+    PFM_DBG("          p_outf_name=%s", p_outf_name);
+    PFM_DBG("          p_ctl_name=%s", p_ctl_name);
+    PFM_DBG("          p_table_name=%s", p_table_name);
+    PFM_DBG("          p_rest=%s", p_rest);
+    PFM_DBG("          p_order_by=%s", p_order_by);
+    PFM_DBG("          p_array_buffer_size=%d", p_array_buffer_size);
+    PFM_DBG("          p_index_name_with_owner=%s"           ,p_index_name_with_owner);
+    PFM_DBG("          p_which_format=%d\n", p_which_format);
+    /* partition 조건이 없는 경우           */
+    /*  partion이 있되 1개의 partion인 경우 */
+    if( parallel_gb == 1 || parallel_gb == 2)
+    {
+        sprintf(select_text,  "select /*+ parallel (pp 24 ) */ * from %s pp %s %s" ,
+                p_table_name,
+                p_rest ,
+                p_order_by );
+    }
+    else if( parallel_gb == 3)  /* partion이 복수인 경우  --- 멀티처리 */
+    {
+        sprintf(select_text, "select /*+ parallel (pp 4 ) */ * from %s  partition ( %s ) pp %s %s",
+                p_table_name,
+                p_prt_name,
+                p_rest,
+                p_order_by );
+    }
+    else    /* 멀티 process가 아닌경우 (zngmf_unload) parallel 처리하지 않는다.  */
+    {
+        if( p_prt_name[0]  == NULL )
+        {
+            sprintf(select_text ,"select * from %s %s %s" ,
+                    p_table_name ,
+                    p_rest ,
+                    p_order_by );
+        }
+        else
+        {
+            sprintf(select_text, "select * from %s partition ( %s ) %s %s",
+                    p_table_name,
+                    p_prt_name,
+                    p_rest,
+                    p_order_by );
+        }
+    }
+    PFM_DBG("\tselect_text=%s", select_text);
+    if (oparse(&(g_cursor) ,(text *)select_text ,OCI_NULL_TERMINATED_STR ,DEFER_PARSE ,NATIVE ))
+    {
+        PFM_ERRS("Error while parsing (oparse) %s:", select_text);
+        handle_oracle_error(&(g_cursor));
+        return RC_ERR;
+    }
+    /*
+     * In this for-loop, we describe all columns in the select-list.
+     * The control-file is written, type-changing is done.
+     * The total size (in bytes) is here running total. In the second
+     * for-loop, we do the odefin calls and the allocation of memory.
+     */
+    for (i = 0; i < MAX_COLUMNS; i++)
+    {
+        /* col_nm_size is reset after each odescr call.
+         * Hence is must be initialized each time
+         */
+        col_nm_size = MAX_OBJECT_LEN - 1;
+        if (odescr(&(g_cursor)
+                    ,(sword) i + 1
+                    ,(sb4 *) &dbsize
+                    ,(sb2 *) &dbtype
+                    ,(sb1 *) col_nm
+                    ,(sb4 *) &col_nm_size
+                    ,(sb4 *) &dsize
+                    ,(sb2 *) &prec
+                    ,(sb2 *) &scale
+                    ,(sb2 *) &nullok
+                  )
+           )
+        {
+            /* If all columns in the table described: break for-loop */
+            if (g_cursor.rc == VAR_NOT_IN_SELECT_LIST)
+            {
+                break;
+            }
+            else
+            {
+                PFM_ERRS("Error odescr, i=%d; statement=%s", i, select_text);
+                handle_oracle_error(&(g_cursor));
+                return RC_ERR;
+            } /* if g_cursor */
+        } /* if odescr */
+        /* At the first column, the control file
+         * with the first part is written
+         */
+        if (i == 0)
+        {
+            outfile = create_control_file(outfile             /* lcr */
+                    ,p_outf_name
+                    ,p_ctl_name
+                    ,p_order_by
+                    ,p_index_name_with_owner
+                    ,p_which_format
+                    ,p_prt_name
+                    ,p_table_name
+                    ,mid
+                    ,action       );
+            if( outfile  == NULL)
+            {
+                PFM_ERRS("ctl파일 생성에 실패 했습니다.");
+                set_error_code( 1000, 1201);
+                return RC_ERR;
+            }
+        }
+        /* Write the column-name in the control-file
+         * (i ? ',' : '(') means:
+         * if i  > 0 (true),  return (
+         * if i == 0 (false), return ,
+         */
+        fprintf(outfile ,"%c %-32.*s",(i ? ',' : '('),col_nm_size,col_nm);
+        /* With fixed format, the display size should be changed
+         * Not necessary with variable format
+         */
+        if (p_which_format == FIXED_FORMAT)
+        {
+            /* Check on dsize. Here, it is used for
+             * the display length in the data-file
+             */
+            switch( dbtype )
+            {
+                case SQLT_NUM:
+                    if (prec)
+                    {
+                        /* room for decimal and minus sign */
+                        dsize = prec + 2;
+                    }
+                    break;
+                    /* Long: max. of MAX_FIELD_SIZE characters is accepted */
+                case  SQLT_LNG:
+                    dsize = MAX_FIELD_SIZE;
+                    break;
+                    /* Oracle internal date format */
+                case SQLT_DAT:
+                    /* exclude enclosing chars (") */
+                    dsize = strlen(ORA_DATE_FORMAT) - 2;
+                    break;
+                    /* long raw also restricted to MAX_FIELD_SIZE bytes */
+                case SQLT_LBI:
+                    dsize = MAX_FIELD_SIZE;
+                    break;
+                default: break;
+            }
+            /* Also, write the position in the data-file */
+            fprintf(outfile,"position(%04d:%04d)  " ,position,position + dsize - 1);
+            /* Increase position */
+            position += dsize;
+        }
+        dsize++;  /* Room for \0. For both formats */
+        /* Another switch on dbtype. Used for printing
+         * the type of the column, for both Fixed and variable
+         */
+        switch (dbtype)
+        {
+            /* Number */
+            case  SQLT_NUM:
+                fprintf(outfile, "decimal external\n" );
+                if (p_which_format == FIXED_FORMAT)
+                    fprintf(outfile,"\t\tnullif (%.*s = BLANKS)\n",col_nm_size,col_nm);
+                break;
+                /* Oracle internal date format */
+            case SQLT_DAT:
+                fprintf(outfile, "date \"%s\"\n", ORA_DATE_FORMAT );
+                if (p_which_format == FIXED_FORMAT)
+                    fprintf(outfile
+                            ,"\t\tnullif (%.*s = BLANKS)\n"
+                            ,col_nm_size
+                            ,col_nm
+                           );
+                dsize = 7;
+                break;
+                /* Long: max. of MAX_FIELD_SIZE characters is accepted */
+            case  SQLT_LNG:
+                /* Long Raw format */
+            case SQLT_LBI:
+                fprintf(outfile, "char\n");
+                dsize = MAX_FIELD_SIZE + 1;
+                break;
+                /* Assume everything else as char */
+            default:
+                /*
+                   if (dbsize >= 255) 
+                   {
+                   fprintf(outfile, "char(%ld)\n", dbsize);
+                   }
+                   else
+                   {
+                   fprintf(outfile, "char\n");
+                   } 
+                 */
+                fprintf(outfile, "char\n");
+                break;
+        }
+        /* Except for date, all columns are returned in string-type */
+        if (dbtype != SQLT_DAT)
+            dbtype = SQLT_STR;
+        /* Save column type */
+        col_type[i] = dbtype;
+        /* Set max. display-length in column lengths array */
+        if (dbtype != SQLT_DAT)
+            col_len[i]  = dsize;
+        else
+            col_len[i]  = strlen(ORA_DATE_FORMAT) - 1;
+        /* Increase max. row-size */
+        rowsize += dsize;
+    } /* for i */
+    /* Save number of columns */
+    number_of_columns = i;
+    /* Close the parenthesis of the column-list */
+    fprintf(outfile, ")\n");
+    /* Close the control-file */
+    fclose(outfile);
+    outfile = NULL;
+    /* Compute number of rows per fetch-call */
+    array_size = p_array_buffer_size / rowsize;
+    /* For all columns:
+     * - allocate memory for value
+     * - allocate memory for indicators
+     * - allocate memory for lengths
+     * - bind column
+     */
+    for (i = 0; i < number_of_columns; i++)
+    {
+        column[i]   = (char *)  malloc(col_len[i]    * array_size);
+        ind_col[i]  = (short *) malloc(sizeof(short) * array_size);
+        col_rlen[i] = (short *) malloc(sizeof(short) * array_size);
+        odefin(&(g_cursor)
+                ,i + 1
+                ,(ub1 *) column[i]
+                ,(sword) col_len[i]
+                ,(sword) col_type[i]
+                ,OCI_PARAMETER_NOT_USED
+                ,(sb2 *) ind_col[i]
+                ,(text *) NULL
+                ,OCI_PARAMETER_NOT_USED
+                ,OCI_PARAMETER_NOT_USED
+                ,(ub2 *) col_rlen[i]
+                ,(ub2 *) NULL
+              );
+    } /* for i */
+
+    /* Create the datafile */
+    //sprintf(df_name, "%s/%s", mid, gs_data_ext_file );
+    sprintf(df_name, "%s/%s", mid, p_outf_name );
+    if ((outfile = fopen(df_name, "w")) == NULL)
+    {
+        PFM_ERRS("Data file %s could not be opened.", df_name);
+        set_error_code( 1000, 1301);
+        return RC_ERR;
+    }
+    /* Set a buffer for output */
+    setbuf(outfile, df_buffer);
+    PFM_DBG("Dumping %30s...  ", p_table_name);
+    fflush(stdout);
+    /* Execute the (data) cursor and fetch the first array */
+    oexfet(&(g_cursor)
+            ,array_size
+            ,OCI_NOT_CANCEL_CURSOR
+            ,OCI_NOT_EXACT
+          );
+    /* Loop until all rows are fetched */
+    while (g_cursor.rc == SQLCODE_OK)
+    {
+        print_rows(g_cursor.rpc - rows_printed
+                ,p_which_format
+                ,number_of_columns
+                ,outfile
+                ,column
+                ,col_type
+                ,col_len
+                ,col_rlen
+                ,ind_col
+                );
+        rows_printed = g_cursor.rpc;
+        ofen(&(g_cursor), array_size);
+    }
+    /* At the last fetch, no-data-found is set if the fetch
+     * returns less rows the the array-size
+     * Process these rows
+     */
+    if (g_cursor.rc == NO_DATA_FOUND)
+    {
+        if (g_cursor.rpc > rows_printed)
+        {
+            print_rows(g_cursor.rpc - rows_printed
+                    ,p_which_format
+                    ,number_of_columns
+                    ,outfile
+                    ,column
+                    ,col_type
+                    ,col_len
+                    ,col_rlen
+                    ,ind_col
+                    );
+        }
+        PFM_DBG("%15ld row(s)", g_cursor.rpc);
+    }
+    else
+    {
+        handle_oracle_error(&(g_cursor));
+        return RC_ERR;
+    }
+    /* Free memory */
+    for (i = 0; i < number_of_columns; i++)
+    {
+        free(column[i]);
+        free(ind_col[i]);
+        free(col_rlen[i]);
+    }
+    /* Close the datafile */
+    fclose(outfile);
+    outfile = NULL;
+    return RC_NRM;
+}
+ 
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+/*
+ * Function : handle_oracle_error
+ * Summary  : Gets and prints Oracle error and terminates
+ * Input    : 1. Pointer to Cursor or LDA structure
+ *               NULL if non-Oracle error
+ *
+ * Output   : ---
+ * Remarks  : terminates program
+ */
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+    static void
+handle_oracle_error(Cda_Def *p_cursor)
+{
+    char msg[MAX_ORACLE_ERROR_SIZE];       /* Buffer for error message */
+    /* if pointer is not null, get appropriate Oracle error message */
+    if (p_cursor != NULL)
+    {
+        /* Obtain error message. When none available, */
+        /* return value of oerhms() is 0 (bytes)      */
+        if (!oerhms(&lda                            /* Login Data Area    */
+                    ,p_cursor->rc                    /* sqlcode            */
+                    ,(text *)msg                     /* buffer             */
+                    ,(sword) sizeof(msg)             /* size of buffer     */
+                   )
+           )
+        {
+            PFM_ERRS("Error: unable to obtain Oracle error message. sqlcode=%d",p_cursor->rc);
+        }
+        else
+        {
+            PFM_ERRS("%s", msg);
+        }
+    }
+    /* Terminate connection with RDBMS. No interest in errors. */
+    //ologof(&lda);
+    return;
+}
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+/*
+ * Function : logoff_from_oracle
+ * Summary  : Terminate connection with Oracle RDBMS
+ * Input    : ---
+ * Output   : ---
+ */
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+    static long
+logoff_from_oracle()
+{
+    if (ologof(&(lda)))
+    {
+        handle_oracle_error((Cda_Def *) &(lda));
+        return RC_ERR;
+    }
+    return RC_NRM;
+}
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+/*
+ * Function : open_cursor
+ * Summary  : Open the cursor in the database
+ * Input    : ---
+ *
+ * Output   : ---
+ *
+ */
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+    static long
+open_cursor()
+{
+    /* Open data-cursor */
+    if (oopen(&(g_cursor)
+                ,&(lda)
+                ,(text *) NULL                         /* dbn obsolete       */
+                ,(sword)  OCI_PARAMETER_NOT_USED       /* dbnl also obsolete */
+                ,(sword)  OCI_PARAMETER_NOT_USED       /* arsize not used    */
+                ,(text *) NULL                         /* uid not used here  */
+                ,(sword)  OCI_NULL_TERMINATED_STR      /* uidl also not used */
+             )
+       )
+    {
+        PFM_DBG("Error opening cursor:");
+        handle_oracle_error(&(g_cursor));
+        return RC_ERR;
+    }
+    return RC_NRM;
+}
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+/*
+ * Function : print_rows
+ * Summary  : print the fetched rows.
+ * Input    :
+ *            1. Number of rows to print
+ *            2. Indicator which format: FIXED_FORMAT or VARIABLE_FORMAT
+ *            3. Number of columns in the table/view
+ *            4. Pointer to FILE struct of datafile
+ *            5. Pointer to array of column-values
+ *            6. Array with types of columns
+ *            7. Array with maximum display-lengths of columne
+ *            8. Pointer to array of indicator-values
+ *
+ * Output   : ---
+ */
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+static void
+print_rows
+(
+ int    p_rows_to_print
+ ,int    p_which_format
+ ,int    p_number_of_columns
+ ,FILE  *p_outf
+ ,char  *p_column[]
+ ,short  p_col_type[]
+ ,short  p_col_len[]
+ ,short  p_col_rlen[]
+ ,short *p_ind_col[]
+ )
+{
+    int   row;                                  /* Current row */
+    int   col;                                  /* Current column */
+    char  date_str[sizeof(ORA_DATE_FORMAT)];   /* String for converting
+                                                * internal date-format
+                                                */
+    char *cp;                                   /* Pointer to current column */
+    /* For each row in the array */
+    for (row = 0; row < p_rows_to_print; row++)
+    {
+        memset( line_buf, 0x00, sizeof(line_buf));
+        /* For each row in the column */
+        for (col = 0; col < p_number_of_columns; col++)
+        {
+            /* If not first column, and variable-format:
+             * write field-separator (= COMMA)
+             */
+            if ((col) && (p_which_format == VARIABLE_FORMAT))
+                //fprintf(p_outf, "%c", COMMA);
+                strcat( line_buf, ",");
+            /* Initialize date_str to empty.
+             * Used for null-values.
+             */
+            date_str[0] = STRING_TERMINATOR;
+            /* If null-value: point cp to empty string
+             * else: point cp to column for current row
+             */
+            if ((short) *(p_ind_col[col] + row) == NULL_INDICATOR)
+                cp = date_str;
+            else
+            {
+                cp  = (char *) p_column[col] + row * p_col_len[col];
+                /* cp += row * p_col_len[col]; */
+                /* If (Oracle) internal date-format,
+                 * and not null: convert date-string
+                 */
+                if (p_col_type[col] == SQLT_DAT)
+                {
+                    convert_ora_date(cp, date_str);
+                    cp = date_str;
+                }
+            }
+            print_column(p_outf, p_which_format, cp, p_col_len[col] - 1);
+        } /* for each column */
+        /* Terminate the line */
+        // fprintf(p_outf, "\n");
+        strcat( line_buf, ",|\n");
+        fprintf( p_outf ,"%-*s",strlen(line_buf),line_buf );
+    } /* for each row */
+    return;
+}
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+/*
+ * Function : print_column
+ * Summary  : print the value of a column in variable format or
+ *            fixed format.
+ * Input    : 1. Pointer to FILE struct of datafile
+ *            2. Indication of format: FIXED_FORMAT or VARIABLE_FORMAT
+ *            3. Pointer to value of column
+ *            4. (maximum) length of column
+ *
+ * Output   : ---
+ */
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+    static void
+print_column( FILE *p_outf, int p_which_format,char *p_column, short p_col_len)
+{
+    switch (p_which_format)
+    {
+        case FIXED_FORMAT:
+            /* Write field; left-aligned */
+            sprintf(line_buf, "%-*s", p_col_len, p_column);
+            break;
+        case VARIABLE_FORMAT:
+            print_var_column(p_outf, p_column);
+            break;
+    } /* switch */
+    return;
+}
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+/*
+ * Function : print_var_column
+ * Summary  : print the value of a column in variable format,
+ *            surrounded with double-quote's if necessary
+ * Input    : 1. Pointer to FILE struct of datafile
+ *            2. Pointer to value of column
+ *
+ * Output   : ---
+ */
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+    static void
+print_var_column( FILE *p_outf, char *p_column)
+{
+    char *cp;    /* Pointer to double-quotes in column-value */
+    int  i;
+    char tmp[MAX_FIELD_SIZE+3];
+    memset( tmp , 0x00, sizeof(tmp));
+    /* Strip all trailing blanks */
+    /* If the column-value contains a comma or a space, it needs to
+     * surrounded with double-quote's. If alse a double-quote in its value,
+     * that double-quotes need to be doubled
+     */
+    /**
+      if ( (strchr(p_column, COMMA) != NULL) ||
+      (strchr(p_column, SPACE) != NULL)
+      )
+     **/
+    if( special_chk(p_column) == 0)
+    {
+        /* The column needs to be surrounded with
+         * double quote's. The first one.
+         */
+        // fprintf(p_outf, "\"");
+        sprintf(tmp,"%s", "\"");
+        strcat(line_buf,tmp);
+        /* Scan the column value for double-quote's in it.
+         * if found: write a double double-quote
+         */
+        while ((cp = strchr(p_column, DOUBLE_QUOTE)) != NULL)
+        {
+            // fprintf(p_outf, "%.*s\"", cp - p_column + 1, p_column);
+            sprintf(tmp, "%.*s\"", cp - p_column + 1, p_column);
+            strcat(line_buf, tmp);
+            p_column = cp + 1;
+        }
+        /* The column needs to be surrounded with
+         * double quote's. The closing one.
+         */
+        // fprintf(p_outf, "%s\"", p_column);
+        sprintf(tmp, "%s\"", p_column);
+        strcat(line_buf, tmp);
+    }
+    else
+    {
+        /* No COMMA or SPACE in the column:
+         * just print the value
+         */
+        // fprintf(p_outf, "%s", p_column);
+        sprintf( tmp, "%s", p_column);
+        strcat(line_buf, tmp);
+    }
+    return;
+}
+    static long
+special_chk( char *p_column)
+{
+    long ix = 0;
+    long len = 0;
+    len = strlen( p_column);
+    for ( ix = 0; ix < len  ; ix++ )
+    {
+        if ( p_column[ix]  ==  44 || p_column[ix] == 32 || p_column[ix] == 9 || p_column[ix] == 34 || p_column[ix] >= 127)
+        {
+            return 0;
+        }
+    }
+    return -1;
+}
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+/*
+ * Function : convert_ora_date
+ * Summary  : Formats Oracle internal date structure
+ *            to a string with format ORA_DATE_FORMAT
+ * Input    : 1. Pointer to input-format
+ *
+ * Output   : 1. Pointer to output format
+ *
+ */
+/* ---------------------------------------------------------------------------------------------------------------------------- */
+    static void
+convert_ora_date( char *p_input_date, char *p_output_date)
+{
+    char century = (char) *(p_input_date + 0);
+    char year    = (char) *(p_input_date + 1);
+    char month   = (char) *(p_input_date + 2);
+    char day     = (char) *(p_input_date + 3);
+    char houre   = (char) *(p_input_date + 4);
+    char minute  = (char) *(p_input_date + 5);
+    char second  = (char) *(p_input_date + 6);
+    short multi  = 1;
+    /* century and year are in excess-100 */
+    if (century < 100)
+    {
+        century = 100 - century;
+        year    = 100 - year;
+        multi   = -1;
+        century = century * multi;
+        year    = year    * multi;
+    }
+    else
+    {
+        century -= 100;
+        year    -= 100;
+    }
+    /* Print the date, formatted. One must be
+     * substracted from houre, minute and second.
+     */
+    sprintf(p_output_date
+            ,"%02d%02d%02d%02d%02d%02d%02d"
+            ,century
+            ,year
+            ,month
+            ,day
+            ,houre  - 1
+            ,minute - 1
+            ,second - 1
+           );
+    /* If date is not 'positive' (before christ), add a minus sign */
+/**
+    if (multi < 0)
+        sprintf(p_output_date, "-%s", p_output_date);
+**/
+    return;
+}
+
+    static long
+set_error_code ( long groupcode, long errorcode )
+{
+    long ix = 0;
+    gl_errcode_ex = errorcode;
+    for( ix = 0 ; errcodeset[ix].number != 0; ix ++)
+    {
+        if( errorcode == errcodeset[ix].number )
+        {
+            strcpy( gs_errmsg_ex, errcodeset[ix].msg);
+            break;
+        }
+    }
+    return RC_NRM;
+}
+ 
+ 
+/* ----------------------------------------------------------------------------------------- */
+    static long
+a000_input_check_1 (zngmf_tab_unload_load_ex_t *itf,zngmf_tab_unload_ex_ctx_t *ctx)
+{
+    long  rc = RC_NRM;
+    memset( target_db_mark, 0x00,sizeof( target_db_mark));
+    if( itf->job_count > 50 )
+    {
+        PFM_ERRS("동시 처리건수가 최대치 50 을 넘었습니다." );
+        set_error_code( 1000, 1002);
+        return RC_ERR;
+    }
+    if( itf->pgmname[0] == NULL )
+    {
+        PFM_ERRS("프로그램명 pgmnam를 확인하세요. pgmnam[%s]", itf->pgmname);
+        set_error_code( 1000, 1002);
+        return RC_ERR;
+    }
+    if( itf->dir[0] == NULL )
+    {
+        PFM_ERRS("작업위치 path를 확인하세요. dir[%s]", itf->dir);
+        set_error_code( 1000, 1002);
+        return RC_ERR;
+    }
+    if( itf->target_db[0] == NULL )
+    {
+        PFM_ERRS("load할 db명을 확인하세요. target_db[%s]", itf->target_db);
+        set_error_code( 1000, 1002);
+        return RC_ERR;
+    }
+    PFM_TRY( a100_set_ctx     ( itf, ctx) );
+    return RC_NRM;
+PFM_CATCH:
+    return RC_ERR;
+}
+/*
+ * owner, tablename ,action, job_count 
+ */
+    static long
+a100_set_ctx (zngmf_tab_unload_load_ex_t *itf,zngmf_tab_unload_ex_ctx_t *ctx)
+{
+    long rc = RC_NRM;
+    /* set ctx 값 */
+    strcpy( ctx->target_db      , itf->target_db );
+    strcpy( ctx->input_table    , itf->table     );
+    /* input_table 명칭으로부터 Owner명을 얻어옴 */ 
+    rc = split_ownername( ctx->input_table ,  ctx->owner , ctx->table_name );
+    if( rc != RC_NRM)
+    {
+        return RC_ERR;
+    }
+    ctx->action       = itf->action;
+    ctx->job_count    = itf->job_count;
+    /* load db type를 얻어온다 */
+    strcpy( target_db_mark,"load_db");
+    return RC_NRM;
+}
+
+    static long
+c000_load ( zngmf_tab_unload_load_ex_t *itf,zngmf_tab_unload_ex_ctx_t *ctx )
+{
+    long rc = RC_NRM;
+    long ix = 0;
+    int  state = 0;
+    int  pid;
+    char base_fmt    [100];
+    char ctl_file_fmt[100];
+    char dat_file_fmt[100];
+    char bad_file_fmt[100];
+    char log_file_fmt[100];
+    char currdate    [ 20];
+    char currtime    [ 20];
+    memset( base_fmt    ,0x00,sizeof( base_fmt));
+    memset( ctl_file_fmt,0x00,sizeof( ctl_file_fmt));
+    memset( dat_file_fmt,0x00,sizeof( dat_file_fmt));
+    memset( bad_file_fmt,0x00,sizeof( bad_file_fmt));
+    memset( log_file_fmt,0x00,sizeof( log_file_fmt));
+    memset( currdate,    0x00,sizeof( currdate));
+    memset( currtime,    0x00,sizeof( currtime));
+    /* 시간 set */
+    cal_curr_date( currdate    );
+    cal_curr_time( currtime, 1 );
+    sprintf( base_fmt,     "%s-%s"             , itf->pgmname, itf->table );
+    /**
+      sprintf( ctl_file_fmt, "%s.%s.%%d"         , base_fmt, "ctl" );
+      sprintf( dat_file_fmt, "%s-%.8s-%.6s%s.%%d", base_fmt, currdate, currtime, ".dat" );
+      sprintf( bad_file_fmt, "%s-%.8s-%.6s%s.%%d", base_fmt, currdate, currtime, ".bad" );
+      sprintf( log_file_fmt, "%s-%.8s-%.6s%s.%%d", base_fmt, currdate, currtime, ".llog");
+     **/
+    /**
+      sprintf( ctl_file_fmt, "%s.%s.%%d"         , base_fmt, "ctl" );
+      sprintf( dat_file_fmt, "%s%s.%%d", base_fmt, ".dat" );
+      sprintf( bad_file_fmt, "%s%s.%%d", base_fmt, ".bad" );
+      sprintf( log_file_fmt, "%s%s.%%d", base_fmt, ".llog");
+     **/
+    sprintf( bad_file_fmt, "%s%s.%%d", base_fmt, ".bad" );
+    sprintf( log_file_fmt, "%s%s.%%d", base_fmt, ".llog");
+    /* ----------------------------------------------------------------------------- */
+    /* truncate이면서 병렬job인 경우는 여기서 trucate하고 모드도 append로 변경시킨다 */
+    /* target 쪽 DB TABLE를 truncate합니다 .                                         */
+    /* ----------------------------------------------------------------------------- */
+    if( ctx->truncate_flag  == 1 )
+    {
+        rc = c001_target_table_truncate( itf, ctx);
+        if( rc != RC_NRM)
+        {
+            return RC_ERR;
+        }
+        PFM_DBG("타겟 TABLE(%s) 먼저 TRUNCATE 하면서 작업합니다. ", ctx->input_table);
+    }
+    PFM_DBG("***  direct_flag  [%d]",   ctx->direct_flag );
+    PFM_DBG("***  multi_flag   [%d]",   ctx->multi_flag  );
+    PFM_DBG("***  rebuild_flag [%d]",   ctx->rebuild_flag);
+    PFM_DBG("***  truncate_flag[%d]",   ctx->truncate_flag);
+    for ( ix = 0; ix < itf->job_count ; ix++ )
+    {
+        /*
+         * data파일, ctl파일, bad파일, log파일을 set한다.
+         */
+        /**
+          sprintf( itf->job[ix].ctl_file, ctl_file_fmt, ix +1 );
+         **/
+        /**
+          sprintf( itf->job[ix].ctl_file, "%s-%s.ctl", itf->pgmname, itf->table);
+          sprintf( itf->job[ix].dat_file, dat_file_fmt, ix +1 );
+          sprintf( itf->job[ix].bad_file, bad_file_fmt, ix +1 );
+          sprintf( itf->job[ix].log_file, log_file_fmt, ix +1 );
+         **/
+        if( itf->job[ix].bad_file[0] == NULL )
+        {
+            sprintf( itf->job[ix].bad_file, bad_file_fmt, ix +1 );
+        }
+        if( itf->job[ix].log_file[0] == NULL )
+        {
+            sprintf( itf->job[ix].log_file, log_file_fmt, ix +1 );
+        }
+        sprintf( itf->job[ix].ctl_filename,"%s/%s", itf->dir,itf->job[ix].ctl_file );
+        sprintf( itf->job[ix].dat_filename,"%s/%s", itf->dir,itf->job[ix].dat_file );
+        sprintf( itf->job[ix].bad_filename,"%s/%s", getenv("LOGBAT"), itf->job[ix].bad_file);
+        sprintf( itf->job[ix].log_filename,"%s/%s", getenv("LOGBAT"), itf->job[ix].log_file);
+        sprintf( itf->job[ix].dir         ,"%s"   , itf->dir    );
+        sprintf( itf->job[ix].table       ,"%s"   , itf->table  );
+        /*  
+         * check_file
+         */
+        rc = file_exist_check(itf->job[ix].ctl_filename);  
+        if( rc != RC_NRM)
+        {
+            PFM_ERRS(" [%ld]번째  ctrl 파일을 access할수 없습니다. [%s]", ix+ 1, itf->job[ix].ctl_filename);
+            return RC_ERR;
+        }
+        rc = file_exist_check(itf->job[ix].dat_filename); 
+        if( rc != RC_NRM)
+        {
+            PFM_ERRS("[%ld]번째 data 파일을 access할수 없습니다. [%s]", ix +1, itf->job[ix].dat_filename);
+            return RC_ERR;
+        }
+
+        itf->job[ix].action = ctx->action;
+        if(  ctx->direct_flag == 1 )
+        {
+            sprintf( itf->job[ix].ld_type, "%s", "DIRECT=TRUE ");
+        }
+        else
+        {
+            sprintf( itf->job[ix].ld_type, "%s", " ");
+        }
+        if( ctx->multi_flag == 1)
+        {
+            strcat ( itf->job[ix].ld_type, "parallel=true skip_index_maintenance=true ");
+        }
+        if( ctx->direct_flag == 0 || ctx->multi_flag == 0)
+        {
+            strcat ( itf->job[ix].ld_type, "rows=1000000 " );
+        }
+        rc = c100_child_proc_1( &itf->job[ix], ctx );
+        if( rc != RC_NRM)
+        {
+            PFM_ERRS( ">>> TABLE LOAD중 에러가 발생했습니다.[%ld]", rc );
+            return RC_ERR;
+        }
+        itf->job[ix].pid = rc;
+    }
+    /*
+     * calling한 프로세세스가 child의 process group id와 같을 동안 대기한다.
+     */
+    while( (pid = waitpid( 0, &state, 0 )) != -1 )
+    {
+        PFM_DBG( "child process return pid ....waitpid[%ld] status[%d]", pid, WEXITSTATUS(state));
+        if ( WSTOPSIG(state ))
+        {
+            PFM_ERRS(" child에서 stop signal 발생 !!!");
+            return RC_ERR;
+        }
+        else if( WCOREDUMP(state))
+        {
+            PFM_ERRS(" child에서 core signal 발생 !!!");
+            return RC_ERR;
+        }
+        else if( WIFSTOPPED(state) || WTERMSIG(state) )
+        {
+            PFM_ERRS(" child에서 term signal 발생 !!!");
+            return RC_ERR;
+        }
+    }
+    return RC_NRM;
+}
+ 
+
+/*
+ *  child 처리
+ */
+    static long
+c100_child_proc_1( zngmf_tab_unload_load_ex_sub_t *job,zngmf_tab_unload_ex_ctx_t *ctx )
+{
+    long rc = RC_NRM;
+    int  iserr = 0;
+    int  pid   = 0;
+    /*
+       (void)signal( SIGCHLD, waitchild);
+     */
+    switch( pid = fork() )
+    {
+        case 0:   /* child */
+            rc = c110_child_fork_proc_1( job, ctx );
+            if( rc != RC_NRM)
+            {
+                PFM_ERRS("child fork process 에러 !!![%ld] 종료 exit", rc);
+                set_error_code( 1000, 1501);
+                exit( -1 );
+            }
+            PFM_DBG("<<<<<<<  CHILD PROCESS 종료 [pid = %ld] exit...[%ld] >>>>>>>", getpid(), rc );
+            exit(0);
+        default:    /* parent */
+            /* child가 끝나기를 기다린다===> 이렇게 되면 child 종료 싯점을 알수 없다. */
+            // waitpid( pid, &iserr, WNOHANG);
+            return RC_NRM;
+        case -1:
+            return RC_ERR;
+    }
+    return RC_NRM;
+}
+/*
+ *   child fork proc
+ */
+    static long
+c110_child_fork_proc_1( zngmf_tab_unload_load_ex_sub_t *job,zngmf_tab_unload_ex_ctx_t *ctx )
+{
+    long rc = RC_NRM; 
+    rc = c111_load_proc_1( job, ctx );
+    if( rc != RC_NRM) 
+    {
+        PFM_ERRS("CHILD LOAD  에러 !!! ");
+        return RC_ERR; 
+    }
+    PFM_DBG(" LOAD TO  DB( %s) SUCCESS.... ", job->table );
+    return RC_NRM; 
+}
+/*
+ *  load job
+ */
+    static long
+c111_load_proc_1( zngmf_tab_unload_load_ex_sub_t *job,zngmf_tab_unload_ex_ctx_t *ctx)
+{
+    long  rc    = RC_NRM;
+    char  cmd_line [1024];
+    int   iserr      = 0;
+    char  conn_info [512];
+    memset( cmd_line, 0x00, sizeof( cmd_line));
+    /* db connection type를 구해온다 */
+    rc = get_target_type (ctx );
+    ngmf_get_dbinfo_ex   ( ctx->target_type, ctx->target_db, conn_info );
+    PFM_DBG("TARGET_TYPE [%s]", ctx->target_type );
+    sprintf( cmd_line, "sqlldr control=%s data=%s bad=%s log=%s %s errors=1000000000 "
+            "bindsize=2048000 readsize=2048000 silent=header,feedback"
+            "<<EOF\n%s\nEOF",
+            job->ctl_filename,
+            job->dat_filename,
+            job->bad_filename,
+            job->log_filename,
+            job->ld_type     , conn_info );
+
+    PFM_DBG(">>LOAD CMD[sqlldr control=%s data=%s bad=%s log=%s %s",
+            job->ctl_filename,
+            job->dat_filename,
+            job->bad_filename,
+            job->log_filename,
+            job->ld_type );
+
+    /* PFM_DBG(">>>>>LOAD CMD[%.100s]",cmd_line); */
+    iserr = system( cmd_line );
+    if( iserr != RC_NRM)
+    {
+        rc = c310_err_exit_proc( ctx,job,iserr );
+        if( rc  != RC_NRM )
+        {
+            return RC_ERR;
+        }
+    }
+    /*  BAD 파일 존재 여부 검사 ...*/
+    PFM_DBG(" BAD 파일 존재 여부 검사 ... ");
+    rc =  check_bad_file( job->bad_filename);
+    if( rc == RC_NRM)
+    {
+        PFM_ERRS("*** BAD 파일이 존재하지만 정상진행합니다.BAD를 확인하세요.[%s] ***",job->bad_filename);
+        set_error_code( 9000, 9001);
+        return RC_NRM; /* 정상 진행 */
+    }
+    return RC_NRM;
+}
+/* --------------------------------------- function body -------------------------------------------*/
+/* 파일 존재 여부 체크                                                                              */
+/* -------------------------------------------------------------------------------------------------*/
+    static long
+file_exist_check( char *filename)
+{
+    long rc;
+    rc = access( filename,F_OK);
+    if( rc != 0)
+    {
+        return RC_ERR; 
+    }
+    return RC_NRM; 
+}
+ 
+/*  청구전용 unload & load job 수행 index parallel 건수 받음 */ 
+    long
+zngmf_tab_unload_load_ex_para(zngmf_tab_unload_load_ex_t *itf, long para_cnt)
+{
+    long rc = RC_NRM;
+    zngmf_tab_unload_ex_ctx_t _ctx;
+    zngmf_tab_unload_ex_ctx_t *ctx = &_ctx;
+    /* 청구전용 parallem up 처리 추가로인한 수정 */
+    gl_com00020_parallel_cnt   =    0;
+    memset( ctx, 0x00, sizeof(zngmf_tab_unload_ex_ctx_t));
+    PFM_DBG("$$ version 정보 : 20090113 $$");
+    /* input 값 검증 */
+    PFM_TRY( a000_input_check     ( itf, ctx));
+    /* 청구전용 parallel 건수 체크 */
+    if (para_cnt  ==  0  ||
+ para_cnt  <   8  ||
+ para_cnt  >  32)
+    {
+ PFM_ERRS("본함수를 사용시는 반드시 parallel건수가 8~32사이입니다");
+        set_error_code( 1000, 1002 );
+ return RC_ERR;
+    }
+    gl_com00020_parallel_cnt  =  para_cnt;
+    /* index check */
+    PFM_TRY( b000_index_check     ( itf, ctx));
+    /* unload / load  처리 */
+    PFM_TRY( c000_unload_load_proc( itf, ctx));
+    /* rebuild 처리   */
+    PFM_TRY( d000_rebuild_proc    ( itf, ctx));
+    /* source에 대한 reconnect 처리 */
+    /**
+      PFM_TRY( e000_source_connect());
+     **/
+    return RC_NRM;
+PFM_CATCH:
+    return RC_ERR;
+}
+ 
+/*  청구전용 unload & load job 수행 index parallel 건수 받음 */ 
+    long
+zngmf_tab_load_ex_para( zngmf_tab_unload_load_ex_t *itf, long para_cnt )
+{
+    long rc = RC_NRM;
+    zngmf_tab_unload_ex_ctx_t _ctx;
+    zngmf_tab_unload_ex_ctx_t *ctx = &_ctx;
+    /* 청구전용 parallem up 처리 추가로인한 수정 */
+    gl_com00020_parallel_cnt   =    0;
+    memset( ctx, 0x00, sizeof(zngmf_tab_unload_ex_ctx_t));
+    PFM_TRY( a000_input_check_1 ( itf, ctx) );
+     
+    /* 청구전용 parallel 건수 체크 */
+    if (para_cnt  ==  0  ||
+ para_cnt  <   8  ||
+ para_cnt  >  32)
+    {
+ PFM_ERRS("본함수를 사용시는 반드시 parallel건수가 8~32사이입니다");
+        set_error_code( 1000, 1002 );
+ return RC_ERR;
+    }
+    gl_com00020_parallel_cnt  =  para_cnt;
+     
+    PFM_TRY( b000_index_check   ( itf, ctx) );
+    PFM_TRY( c000_load          ( itf, ctx) ); 
+    PFM_TRY( d000_rebuild_proc  ( itf, ctx) );
+    return RC_NRM;
+PFM_CATCH:
+    return RC_ERR;
+}
